@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -8,7 +9,7 @@ from uuid import uuid4
 
 import asyncpg
 from fastapi import FastAPI, Header, HTTPException, Path, Request
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import AnyHttpUrl, BaseModel, Field, TypeAdapter, ValidationError
 
 ExternalIdentifier = Annotated[str, Field(strict=True, min_length=1, max_length=128)]
 
@@ -18,6 +19,19 @@ class PaymentPayload(BaseModel):
     user_id: ExternalIdentifier
     tokens: Annotated[int, Field(strict=True, gt=0)]
     status: str
+
+
+class GeneratePayload(BaseModel):
+    user_id: ExternalIdentifier
+    model_slug: ExternalIdentifier
+    prompt: str
+    ref_images: object = Field(
+        default_factory=list,
+        json_schema_extra={
+            "type": "array",
+            "items": {"type": "string", "format": "uri"},
+        },
+    )
 
 
 def create_app() -> FastAPI:
@@ -145,6 +159,101 @@ def create_app() -> FastAPI:
                 )
 
         return {"status": "succeeded"}
+
+    @application.post("/generate", status_code=202)
+    async def generate(payload: GeneratePayload) -> dict[str, str]:
+        if not payload.prompt.strip():
+            raise HTTPException(status_code=400, detail="Prompt must not be empty")
+
+        try:
+            ref_images = TypeAdapter(list[AnyHttpUrl]).validate_python(
+                payload.ref_images
+            )
+        except ValidationError as error:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid reference images",
+            ) from error
+
+        async with get_pool().acquire() as connection:
+            async with connection.transaction():
+                model = await connection.fetchrow(
+                    "SELECT price FROM models WHERE slug = $1",
+                    payload.model_slug,
+                )
+                if model is None:
+                    raise HTTPException(status_code=404, detail="Model not found")
+
+                legs = await connection.fetch(
+                    "SELECT max_ref_images FROM model_legs WHERE model_slug = $1",
+                    payload.model_slug,
+                )
+                if not any(
+                    len(ref_images) <= leg["max_ref_images"] for leg in legs
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "No provider leg accepts this number of reference "
+                            "images"
+                        ),
+                    )
+
+                user = await connection.fetchrow(
+                    "SELECT balance FROM users WHERE user_id = $1 FOR UPDATE",
+                    payload.user_id,
+                )
+                if user is None or user["balance"] < model["price"]:
+                    raise HTTPException(
+                        status_code=402,
+                        detail="Insufficient balance",
+                    )
+
+                task_id = uuid4()
+                debited_balance = await connection.fetchval(
+                    """
+                    UPDATE users
+                    SET balance = balance - $2
+                    WHERE user_id = $1 AND balance >= $2
+                    RETURNING balance
+                    """,
+                    payload.user_id,
+                    model["price"],
+                )
+                if debited_balance is None:
+                    raise HTTPException(
+                        status_code=402,
+                        detail="Insufficient balance",
+                    )
+
+                await connection.execute(
+                    """
+                    INSERT INTO tasks (
+                        task_id, user_id, model_slug, prompt, ref_images, price
+                    )
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+                    """,
+                    task_id,
+                    payload.user_id,
+                    payload.model_slug,
+                    payload.prompt,
+                    json.dumps([str(image) for image in ref_images]),
+                    model["price"],
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO ledger_entries (
+                        entry_id, user_id, delta, operation, payment_id, task_id
+                    )
+                    VALUES ($1, $2, $3, 'debit', NULL, $4)
+                    """,
+                    uuid4(),
+                    payload.user_id,
+                    -model["price"],
+                    task_id,
+                )
+
+        return {"task_id": str(task_id)}
 
     @application.get("/users/{user_id}/balance")
     async def get_balance(
