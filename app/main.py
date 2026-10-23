@@ -209,6 +209,20 @@ def create_app() -> FastAPI:
                         detail="Insufficient balance",
                     )
 
+                active_task_count = await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM tasks
+                    WHERE user_id = $1 AND status NOT IN ('completed', 'failed')
+                    """,
+                    payload.user_id,
+                )
+                if active_task_count >= 3:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="User has reached the active task limit",
+                    )
+
                 task_id = uuid4()
                 debited_balance = await connection.fetchval(
                     """

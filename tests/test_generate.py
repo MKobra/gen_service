@@ -181,6 +181,91 @@ async def test_concurrent_generate_debits_once_at_exact_balance(
     await assert_balance_matches_ledger(database_connection, user_id)
 
 
+async def test_concurrent_generate_respects_active_task_limit(
+    service_client: httpx.AsyncClient,
+    database_connection: asyncpg.Connection,
+    user_id: str,
+    payment_id: str,
+) -> None:
+    user_id = f"Generate-limit-user-{user_id}"
+    payment_id = f"Generate-limit-payment-{payment_id}"
+    tokens = 100
+    secret = os.getenv("WEBHOOK_SECRET", "test-secret").encode("utf-8")
+
+    payment_body = {
+        "payment_id": payment_id,
+        "user_id": user_id,
+        "tokens": tokens,
+        "status": "succeeded",
+    }
+    payment_raw_body = json.dumps(
+        payment_body,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payment_signature = hmac.new(
+        secret,
+        payment_raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    payment_response = await service_client.post(
+        "/webhooks/payments",
+        content=payment_raw_body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Signature": payment_signature,
+        },
+    )
+    assert 200 <= payment_response.status_code < 300, (
+        "Could not fund the active-task-limit user"
+    )
+
+    generate_payload = {
+        "user_id": user_id,
+        "model_slug": "image-fast",
+        "prompt": "Concurrent active-task limit test",
+        "ref_images": [],
+    }
+    responses = await asyncio.gather(
+        *(
+            service_client.post("/generate", json=generate_payload)
+            for _ in range(10)
+        )
+    )
+
+    statuses = [response.status_code for response in responses]
+    assert statuses.count(202) == 3, (
+        "Exactly three concurrent tasks must be accepted"
+    )
+    assert statuses.count(429) == 7, (
+        "Requests beyond the three active-task limit must receive 429"
+    )
+
+    task_count = await database_connection.fetchval(
+        "SELECT COUNT(*) FROM tasks WHERE user_id = $1",
+        user_id,
+    )
+    assert task_count == 3, "Only three active tasks must be created"
+
+    debit_rows = await database_connection.fetch(
+        """
+        SELECT delta
+        FROM ledger_entries
+        WHERE user_id = $1 AND operation = 'debit'
+        """,
+        user_id,
+    )
+    assert len(debit_rows) == 3, "Only three task debits must be journaled"
+    assert sum(row["delta"] for row in debit_rows) == -6, (
+        "Accepted tasks must spend exactly three model prices"
+    )
+
+    balance_response = await service_client.get(f"/users/{user_id}/balance")
+    assert balance_response.is_success
+    assert balance_response.json()["balance"] == tokens - 6
+
+    await assert_balance_matches_ledger(database_connection, user_id)
+
+
 async def test_generate_returns_402_without_charging_or_creating_user(
     service_client: httpx.AsyncClient,
     database_connection: asyncpg.Connection,
