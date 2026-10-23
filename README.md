@@ -8,6 +8,14 @@ Start PostgreSQL and the four-worker API:
 docker compose up --build
 ```
 
+Compose waits for PostgreSQL, applies `alembic upgrade head` once, then starts the API workers. To create the next migration, run:
+
+```bash
+docker compose run --rm migrate alembic -c pyproject.toml revision -m "describe the schema change"
+```
+
+The migration service applies new revisions on the next `docker compose up`.
+
 Install the test tools and run the health check from another terminal:
 
 ```bash

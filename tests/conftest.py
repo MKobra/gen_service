@@ -6,6 +6,7 @@ import asyncpg
 import httpx
 import pytest
 import pytest_asyncio
+from helpers import assert_all_balances_match_ledger
 
 
 @pytest.fixture
@@ -30,6 +31,14 @@ async def database_connection() -> AsyncIterator[asyncpg.Connection]:
         yield connection
     finally:
         await connection.close()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def check_all_balances_after_test(
+    database_connection: asyncpg.Connection,
+) -> AsyncIterator[None]:
+    yield
+    await assert_all_balances_match_ledger(database_connection)
 
 
 @pytest.fixture

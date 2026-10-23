@@ -1,6 +1,23 @@
 import asyncpg
 
 
+async def assert_all_balances_match_ledger(
+    connection: asyncpg.Connection,
+) -> None:
+    rows = await connection.fetch(
+        """
+        SELECT users.user_id, users.balance,
+               COALESCE(SUM(ledger_entries.delta), 0) AS ledger_balance
+        FROM users
+        LEFT JOIN ledger_entries ON ledger_entries.user_id = users.user_id
+        GROUP BY users.user_id, users.balance
+        """
+    )
+
+    for row in rows:
+        assert row["balance"] == row["ledger_balance"]
+
+
 async def assert_balance_matches_ledger(
     connection: asyncpg.Connection,
     user_id: str,

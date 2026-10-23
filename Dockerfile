@@ -4,6 +4,7 @@ WORKDIR /service
 
 COPY pyproject.toml ./
 COPY app ./app
+COPY migrations ./migrations
 
 RUN pip install --no-cache-dir .
 

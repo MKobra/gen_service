@@ -16,9 +16,19 @@ services:
   app:
     build: .
     environment:
-      DATABASE_URL: postgresql://gen_service:gen_service@db:5432/gen_service
+      APP_DATABASE_URL: postgresql://gen_service_app:gen_service_app@db:5432/gen_service
+      WEBHOOK_SECRET: test-secret
     ports:
       - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  migrate:
+    build: .
+    command: ["alembic", "-c", "pyproject.toml", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql://gen_service:gen_service@db:5432/gen_service
     depends_on:
       db:
         condition: service_healthy
