@@ -7,7 +7,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 
@@ -71,6 +71,10 @@ async def health() -> dict[str, str]:
 
 @app.post("/tasks", status_code=202)
 async def create_task(payload: TaskPayload) -> dict[str, str]:
+    sync_failure_prompt = os.getenv("FAKE_PROVIDER_SYNC_FAILURE_PROMPT")
+    if sync_failure_prompt is not None and payload.prompt == sync_failure_prompt:
+        raise HTTPException(status_code=503, detail="Configured synchronous failure")
+
     external_id = str(uuid4())
     asyncio.create_task(send_completion(external_id, payload.prompt))
     return {"external_id": external_id}

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import asyncpg
 from fastapi import FastAPI, Header, HTTPException, Path, Request
@@ -51,6 +51,9 @@ class ProviderCallback(BaseModel):
     error_type: Literal["technical", "moderation", "payload"] | None = None
 
 
+ProviderErrorType = Literal["technical", "moderation", "payload"]
+
+
 def create_app() -> FastAPI:
     pool: asyncpg.Pool | None = None
 
@@ -81,6 +84,114 @@ def create_app() -> FastAPI:
         )
         with urlopen(request, timeout=10) as response:
             return ProviderAccepted.model_validate_json(response.read())
+
+    async def fail_attempt(
+        connection: asyncpg.Connection | asyncpg.pool.PoolConnectionProxy,
+        attempt_id: UUID,
+        error_type: ProviderErrorType,
+        expected_status: Literal["dispatching", "waiting"],
+    ) -> None:
+        attempt = await connection.fetchrow(
+            """
+            UPDATE task_attempts
+            SET status = 'failed', error_type = $2, dispatch_lease_until = NULL
+            WHERE attempt_id = $1 AND status = $3
+            RETURNING task_id, attempt_number, provider
+            """,
+            attempt_id,
+            error_type,
+            expected_status,
+        )
+        if attempt is None:
+            return
+
+        task = await connection.fetchrow(
+            """
+            SELECT user_id, price, model_slug,
+                   jsonb_array_length(ref_images) AS ref_image_count
+            FROM tasks
+            WHERE task_id = $1 AND status = 'processing'
+            FOR UPDATE
+            """,
+            attempt["task_id"],
+        )
+        if task is None:
+            return
+
+        if error_type != "payload":
+            current_priority = await connection.fetchval(
+                """
+                SELECT priority
+                FROM model_legs
+                WHERE model_slug = $1 AND provider = $2
+                  AND max_ref_images >= $3
+                ORDER BY priority
+                LIMIT 1
+                """,
+                task["model_slug"],
+                attempt["provider"],
+                task["ref_image_count"],
+            )
+            if current_priority is not None:
+                next_leg = await connection.fetchrow(
+                    """
+                    SELECT provider
+                    FROM model_legs
+                    WHERE model_slug = $1 AND priority > $2
+                      AND max_ref_images >= $3
+                      AND (NOT skip_on_moderation OR $4 <> 'moderation')
+                    ORDER BY priority
+                    LIMIT 1
+                    """,
+                    task["model_slug"],
+                    current_priority,
+                    task["ref_image_count"],
+                    error_type,
+                )
+                if next_leg is not None:
+                    await connection.execute(
+                        """
+                        INSERT INTO task_attempts (
+                            attempt_id, task_id, attempt_number, provider, status
+                        )
+                        VALUES ($1, $2, $3, $4, 'pending')
+                        """,
+                        uuid4(),
+                        attempt["task_id"],
+                        attempt["attempt_number"] + 1,
+                        next_leg["provider"],
+                    )
+                    return
+
+        failed_task = await connection.fetchrow(
+            """
+            UPDATE tasks
+            SET status = 'failed'
+            WHERE task_id = $1 AND status = 'processing'
+            RETURNING user_id, price
+            """,
+            attempt["task_id"],
+        )
+        if failed_task is None:
+            return
+
+        await connection.execute(
+            "UPDATE users SET balance = balance + $2 WHERE user_id = $1",
+            failed_task["user_id"],
+            failed_task["price"],
+        )
+        await connection.execute(
+            """
+            INSERT INTO ledger_entries (
+                entry_id, user_id, delta, operation, payment_id, task_id
+            )
+            VALUES ($1, $2, $3, 'refund', NULL, $4)
+            """,
+            uuid4(),
+            failed_task["user_id"],
+            failed_task["price"],
+            attempt["task_id"],
+        )
 
     async def dispatch_attempts() -> None:
         while True:
@@ -140,15 +251,13 @@ def create_app() -> FastAPI:
                 except Exception:
                     logger.exception("Provider task dispatch failed")
                     async with get_pool().acquire() as connection:
-                        await connection.execute(
-                            """
-                            UPDATE task_attempts
-                            SET status = 'failed', error_type = 'technical',
-                                dispatch_lease_until = NULL
-                            WHERE attempt_id = $1 AND status = 'dispatching'
-                            """,
-                            attempt["attempt_id"],
-                        )
+                        async with connection.transaction():
+                            await fail_attempt(
+                                connection,
+                                attempt["attempt_id"],
+                                "technical",
+                                "dispatching",
+                            )
                     continue
 
                 async with get_pool().acquire() as connection:
@@ -537,54 +646,17 @@ def create_app() -> FastAPI:
                         attempt["attempt_id"],
                     )
                 else:
-                    await connection.execute(
-                        """
-                        UPDATE task_attempts
-                        SET status = 'failed', error_type = $2
-                        WHERE attempt_id = $1
-                        """,
+                    if payload.error_type is None:
+                        raise HTTPException(
+                            status_code=422,
+                            detail="Missing error_type",
+                        )
+                    await fail_attempt(
+                        connection,
                         attempt["attempt_id"],
                         payload.error_type,
+                        "waiting",
                     )
-                    if payload.error_type == "technical":
-                        task = await connection.fetchrow(
-                            """
-                            SELECT model_slug, jsonb_array_length(ref_images)
-                                AS ref_image_count
-                            FROM tasks
-                            WHERE task_id = $1 AND status = 'processing'
-                            FOR UPDATE
-                            """,
-                            attempt["task_id"],
-                        )
-                        if task is not None:
-                            next_leg = await connection.fetchrow(
-                                """
-                                SELECT provider
-                                FROM model_legs
-                                WHERE model_slug = $1 AND max_ref_images >= $2
-                                ORDER BY priority
-                                OFFSET $3
-                                LIMIT 1
-                                """,
-                                task["model_slug"],
-                                task["ref_image_count"],
-                                attempt["attempt_number"],
-                            )
-                            if next_leg is not None:
-                                await connection.execute(
-                                    """
-                                    INSERT INTO task_attempts (
-                                        attempt_id, task_id, attempt_number,
-                                        provider, status
-                                    )
-                                    VALUES ($1, $2, $3, $4, 'pending')
-                                    """,
-                                    uuid4(),
-                                    attempt["task_id"],
-                                    attempt["attempt_number"] + 1,
-                                    next_leg["provider"],
-                                )
 
         return {"status": "accepted"}
 
