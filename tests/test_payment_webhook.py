@@ -59,6 +59,8 @@ async def test_concurrent_duplicate_payments_are_credited_once(
     user_id: str,
     payment_id: str,
 ) -> None:
+    """20 одновременных платежей с одинаковым ID приводят к
+    одному начислению и правильному балансу."""
     user_id = f"User-{user_id}"
     payment_id = f"Payment-{payment_id}"
     tokens = 17
@@ -87,18 +89,24 @@ async def test_concurrent_duplicate_payments_are_credited_once(
         )
     )
 
-    assert all(200 <= response.status_code < 300 for response in responses)
+    assert all(200 <= response.status_code < 300 for response in responses), \
+        f"статусы: {[r.status_code for r in responses]}"
 
     journal = await read_journal(database_connection, user_id)
-    assert len(journal) == 1
-    assert journal[0]["delta"] == tokens
-    assert journal[0]["payment_id"] == payment_id
+    assert len(journal) == 1, f"начислений: {len(journal)}"
+    assert journal[0]["delta"] == tokens, f"начислено: {journal[0]['delta']}"
+    assert journal[0]["payment_id"] == payment_id, \
+        f"payment_id: {journal[0]['payment_id']}"
 
     balance_response = await service_client.get(f"/users/{user_id}/balance")
     assert balance_response.is_success
-    assert balance_response.json()["balance"] == tokens
+    assert balance_response.json()["balance"] == tokens, \
+        f"баланс: {balance_response.json()['balance']}"
 
     await assert_balance_matches_ledger(database_connection, user_id)
+    
+    print(f"запросов: {len(responses)}, статусы: 200x{len(responses)}, "
+          f"начислений: {len(journal)}, баланс: {tokens}")
 
 
 async def test_concurrent_first_payments_create_user_once(

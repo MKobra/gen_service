@@ -30,6 +30,7 @@ include = ["app*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "-v -rP"
 
 [tool.alembic]
 script_location = "%(here)s/migrations"

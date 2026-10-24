@@ -109,6 +109,8 @@ async def test_concurrent_failures_on_last_leg_refund_once(
     database_connection: asyncpg.Connection,
     user_id: str,
 ) -> None:
+    """10 одновременных отказов последнего этапа приводят к
+    одному возврату и сохранению баланса."""
     task_user_id = f"Last-leg-refund-user-{user_id}"
     task_id = await create_funded_task(
         service_client,
@@ -138,14 +140,16 @@ async def test_concurrent_failures_on_last_leg_refund_once(
             for _ in range(10)
         )
     )
-    assert all(response.is_success for response in responses)
+    assert all(response.is_success for response in responses), \
+        f"статусы: {[r.status_code for r in responses]}"
 
     task = await read_task(service_client, task_id)
-    assert task["status"] == "failed"
+    assert task["status"] == "failed", f"статус: {task['status']}"
     assert [attempt["provider"] for attempt in task["attempts"]] == [
         "alpha",
         "beta",
-    ]
+    ], f"провайдеры: {[a['provider'] for a in task['attempts']]}"
+
     refunds = await database_connection.fetchval(
         """
         SELECT COUNT(*)
@@ -154,12 +158,16 @@ async def test_concurrent_failures_on_last_leg_refund_once(
         """,
         task_id,
     )
-    assert refunds == 1
+    assert refunds == 1, f"возвратов: {refunds}"
     balance = await database_connection.fetchval(
         "SELECT balance FROM users WHERE user_id = $1",
         task_user_id,
     )
-    assert balance == 2
+    assert balance == 2, f"баланс: {balance}"
+    
+    print(f"параллельных отказов: {len(responses)}, статусы: 200x{len(responses)}, "
+          f"возвратов: {refunds}, статус задачи: {task['status']}, "
+          f"баланс после возврата: {balance}")
 
 
 async def test_moderation_skip_and_payload_failure_refund(

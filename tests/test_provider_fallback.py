@@ -12,6 +12,7 @@ async def test_first_provider_failure_completes_on_second_leg(
     user_id: str,
     payment_id: str,
 ) -> None:
+    """Отказ первого провайдера приводит к успешному завершению на втором провайдере."""
     user_id = f"Provider-fallback-user-{user_id}"
     payment_id = f"Provider-fallback-payment-{payment_id}"
     payment_body = {
@@ -63,16 +64,27 @@ async def test_first_provider_failure_completes_on_second_leg(
     else:
         raise AssertionError("Task did not finish after provider fallback")
 
-    assert task["status"] == "completed"
-    assert task["current_leg"] == "beta"
-    assert task["result_url"]
+    assert task["status"] == "completed", f"статус: {task['status']}"
+    assert task["current_leg"] == "beta", f"этап: {task['current_leg']}"
+    assert task["result_url"], f"результат: {task['result_url']}"
     assert [attempt["provider"] for attempt in task["attempts"]] == [
         "alpha",
         "beta",
-    ]
+    ], f"провайдеры: {[a['provider'] for a in task['attempts']]}"
+
+    attempts_chain = [f"{a['provider']}:{a['status']}" for a in task["attempts"]]
+    balance_response = await service_client.get(f"/users/{user_id}/balance")
+    balance_response.raise_for_status()
+    balance = balance_response.json()["balance"]
+    print(f"цепочка: {' → '.join(attempts_chain)}, статус: {task['status']}, "
+          f"попыток: {len(task['attempts'])}, баланс: {balance}")
+    
     assert [attempt["status"] for attempt in task["attempts"]] == [
         "failed",
         "completed",
-    ]
-    assert task["attempts"][0]["error_type"] == "technical"
-    assert task["attempts"][1]["error_type"] is None
+    ], f"статусы: {[a['status'] for a in task['attempts']]}"
+
+    assert task["attempts"][0]["error_type"] == "technical", \
+        f"ошибка: {task['attempts'][0]['error_type']}"
+    assert task["attempts"][1]["error_type"] is None, \
+        f"ошибка: {task['attempts'][1]['error_type']}"
