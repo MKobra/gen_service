@@ -36,6 +36,8 @@ services:
     environment:
       APP_CALLBACK_URL: http://app:8000
       FAKE_PROVIDER_DELAY_SECONDS: "1"
+      FAKE_PROVIDER_FAILURE_TYPE: ${FAKE_PROVIDER_ALPHA_FAILURE_TYPE:-technical}
+      FAKE_PROVIDER_FAILURE_PROMPT: ${FAKE_PROVIDER_ALPHA_FAILURE_PROMPT:-Provider fallback test}
       PROVIDER_NAME: alpha
       WEBHOOK_SECRET: test-secret
 

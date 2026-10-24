@@ -502,7 +502,7 @@ def create_app() -> FastAPI:
             async with connection.transaction():
                 attempt = await connection.fetchrow(
                     """
-                    SELECT attempt_id, task_id, status
+                    SELECT attempt_id, task_id, attempt_number, status
                     FROM task_attempts
                     WHERE provider = $1 AND external_id = $2
                     FOR UPDATE
@@ -546,6 +546,45 @@ def create_app() -> FastAPI:
                         attempt["attempt_id"],
                         payload.error_type,
                     )
+                    if payload.error_type == "technical":
+                        task = await connection.fetchrow(
+                            """
+                            SELECT model_slug, jsonb_array_length(ref_images)
+                                AS ref_image_count
+                            FROM tasks
+                            WHERE task_id = $1 AND status = 'processing'
+                            FOR UPDATE
+                            """,
+                            attempt["task_id"],
+                        )
+                        if task is not None:
+                            next_leg = await connection.fetchrow(
+                                """
+                                SELECT provider
+                                FROM model_legs
+                                WHERE model_slug = $1 AND max_ref_images >= $2
+                                ORDER BY priority
+                                OFFSET $3
+                                LIMIT 1
+                                """,
+                                task["model_slug"],
+                                task["ref_image_count"],
+                                attempt["attempt_number"],
+                            )
+                            if next_leg is not None:
+                                await connection.execute(
+                                    """
+                                    INSERT INTO task_attempts (
+                                        attempt_id, task_id, attempt_number,
+                                        provider, status
+                                    )
+                                    VALUES ($1, $2, $3, $4, 'pending')
+                                    """,
+                                    uuid4(),
+                                    attempt["task_id"],
+                                    attempt["attempt_number"] + 1,
+                                    next_leg["provider"],
+                                )
 
         return {"status": "accepted"}
 

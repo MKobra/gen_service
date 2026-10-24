@@ -34,15 +34,24 @@ def post_webhook(url: str, body: bytes, signature: str) -> None:
         pass
 
 
-async def send_completion(external_id: str) -> None:
+async def send_completion(external_id: str, prompt: str) -> None:
     delay = float(os.getenv("FAKE_PROVIDER_DELAY_SECONDS", "1"))
     await asyncio.sleep(delay)
     provider_name = os.environ["PROVIDER_NAME"]
-    callback = {
-        "external_id": external_id,
-        "status": "completed",
-        "result_url": f"https://files.example/{external_id}",
-    }
+    failure_type = os.getenv("FAKE_PROVIDER_FAILURE_TYPE")
+    failure_prompt = os.getenv("FAKE_PROVIDER_FAILURE_PROMPT")
+    if failure_type and (failure_prompt is None or prompt == failure_prompt):
+        callback = {
+            "external_id": external_id,
+            "status": "failed",
+            "error_type": failure_type,
+        }
+    else:
+        callback = {
+            "external_id": external_id,
+            "status": "completed",
+            "result_url": f"https://files.example/{external_id}",
+        }
     raw_body = json.dumps(callback, separators=(",", ":")).encode("utf-8")
     secret = os.environ["WEBHOOK_SECRET"].encode("utf-8")
     signature = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
@@ -63,5 +72,5 @@ async def health() -> dict[str, str]:
 @app.post("/tasks", status_code=202)
 async def create_task(payload: TaskPayload) -> dict[str, str]:
     external_id = str(uuid4())
-    asyncio.create_task(send_completion(external_id))
+    asyncio.create_task(send_completion(external_id, payload.prompt))
     return {"external_id": external_id}
