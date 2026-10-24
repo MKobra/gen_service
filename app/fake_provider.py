@@ -35,6 +35,9 @@ def post_webhook(url: str, body: bytes, signature: str) -> None:
 
 
 async def send_completion(external_id: str, prompt: str) -> None:
+    if prompt == os.getenv("FAKE_PROVIDER_SILENT_PROMPT"):
+        return
+
     delay = float(os.getenv("FAKE_PROVIDER_DELAY_SECONDS", "1"))
     await asyncio.sleep(delay)
     provider_name = os.environ["PROVIDER_NAME"]

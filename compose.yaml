@@ -20,6 +20,7 @@ services:
       WEBHOOK_SECRET: test-secret
       PROVIDER_ALPHA_URL: http://alpha:8001
       PROVIDER_BETA_URL: http://beta:8002
+      PROVIDER_TIMEOUT: ${PROVIDER_TIMEOUT:-2}
     ports:
       - "8000:8000"
     depends_on:
@@ -39,6 +40,7 @@ services:
       FAKE_PROVIDER_FAILURE_TYPE: ${FAKE_PROVIDER_ALPHA_FAILURE_TYPE:-technical}
       FAKE_PROVIDER_FAILURE_PROMPT: ${FAKE_PROVIDER_ALPHA_FAILURE_PROMPT:-Provider fallback test}
       FAKE_PROVIDER_SYNC_FAILURE_PROMPT: ${FAKE_PROVIDER_ALPHA_SYNC_FAILURE_PROMPT:-Provider synchronous failure test}
+      FAKE_PROVIDER_SILENT_PROMPT: ${FAKE_PROVIDER_ALPHA_SILENT_PROMPT:-Provider timeout late callback test}
       PROVIDER_NAME: alpha
       WEBHOOK_SECRET: test-secret
 

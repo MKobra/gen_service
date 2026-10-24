@@ -56,6 +56,9 @@ ProviderErrorType = Literal["technical", "moderation", "payload"]
 
 def create_app() -> FastAPI:
     pool: asyncpg.Pool | None = None
+    provider_timeout_seconds = float(os.getenv("PROVIDER_TIMEOUT", "60"))
+    if provider_timeout_seconds <= 0:
+        raise ValueError("PROVIDER_TIMEOUT must be positive")
 
     def get_pool() -> asyncpg.Pool:
         if pool is None:
@@ -90,15 +93,18 @@ def create_app() -> FastAPI:
         attempt_id: UUID,
         error_type: ProviderErrorType,
         expected_status: Literal["dispatching", "waiting"],
+        target_status: Literal["failed", "timed_out"],
     ) -> None:
         attempt = await connection.fetchrow(
             """
             UPDATE task_attempts
-            SET status = 'failed', error_type = $2, dispatch_lease_until = NULL
-            WHERE attempt_id = $1 AND status = $3
+            SET status = $2, error_type = $3, dispatch_lease_until = NULL,
+                provider_timeout_at = NULL
+            WHERE attempt_id = $1 AND status = $4
             RETURNING task_id, attempt_number, provider
             """,
             attempt_id,
+            target_status,
             error_type,
             expected_status,
         )
@@ -257,6 +263,7 @@ def create_app() -> FastAPI:
                                 attempt["attempt_id"],
                                 "technical",
                                 "dispatching",
+                                "failed",
                             )
                     continue
 
@@ -265,16 +272,52 @@ def create_app() -> FastAPI:
                         """
                         UPDATE task_attempts
                         SET status = 'waiting', external_id = $2,
-                            dispatch_lease_until = NULL
+                            dispatch_lease_until = NULL,
+                            provider_timeout_at = now() + $3 * interval '1 second'
                         WHERE attempt_id = $1 AND status = 'dispatching'
                         """,
                         attempt["attempt_id"],
                         accepted.external_id,
+                        provider_timeout_seconds,
                     )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Attempt dispatcher failed")
+                await asyncio.sleep(0.5)
+
+    async def watch_provider_attempts() -> None:
+        while True:
+            try:
+                async with get_pool().acquire() as connection:
+                    async with connection.transaction():
+                        attempt_id = await connection.fetchval(
+                            """
+                            SELECT attempts.attempt_id
+                            FROM task_attempts AS attempts
+                            JOIN tasks ON tasks.task_id = attempts.task_id
+                            WHERE attempts.status = 'waiting'
+                              AND attempts.provider_timeout_at <= now()
+                              AND tasks.status = 'processing'
+                            ORDER BY attempts.provider_timeout_at
+                            FOR UPDATE OF attempts SKIP LOCKED
+                            LIMIT 1
+                            """
+                        )
+                        if attempt_id is not None:
+                            await fail_attempt(
+                                connection,
+                                attempt_id,
+                                "technical",
+                                "waiting",
+                                "timed_out",
+                            )
+                if attempt_id is None:
+                    await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Provider timeout watcher failed")
                 await asyncio.sleep(0.5)
 
     @asynccontextmanager
@@ -286,14 +329,17 @@ def create_app() -> FastAPI:
             max_size=10,
         )
         dispatcher = asyncio.create_task(dispatch_attempts())
+        timeout_watcher = asyncio.create_task(watch_provider_attempts())
         try:
             yield
         finally:
             dispatcher.cancel()
-            try:
-                await dispatcher
-            except asyncio.CancelledError:
-                pass
+            timeout_watcher.cancel()
+            for background_task in (dispatcher, timeout_watcher):
+                try:
+                    await background_task
+                except asyncio.CancelledError:
+                    pass
             await pool.close()
             pool = None
 
@@ -622,6 +668,18 @@ def create_app() -> FastAPI:
                 if attempt is None:
                     raise HTTPException(status_code=404, detail="Attempt not found")
                 if attempt["status"] != "waiting":
+                    if (
+                        payload.status == "completed"
+                        and attempt["status"] == "timed_out"
+                    ):
+                        await connection.execute(
+                            """
+                            UPDATE task_attempts
+                            SET status = 'late_ignored'
+                            WHERE attempt_id = $1 AND status = 'timed_out'
+                            """,
+                            attempt["attempt_id"],
+                        )
                     return {"status": "ignored"}
 
                 if payload.status == "completed":
@@ -640,7 +698,7 @@ def create_app() -> FastAPI:
                     await connection.execute(
                         """
                         UPDATE task_attempts
-                        SET status = 'completed'
+                        SET status = 'completed', provider_timeout_at = NULL
                         WHERE attempt_id = $1
                         """,
                         attempt["attempt_id"],
@@ -656,6 +714,7 @@ def create_app() -> FastAPI:
                         attempt["attempt_id"],
                         payload.error_type,
                         "waiting",
+                        "failed",
                     )
 
         return {"status": "accepted"}
