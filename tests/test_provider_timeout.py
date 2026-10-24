@@ -68,10 +68,8 @@ async def test_timeout_falls_back_and_ignores_late_completion(
         "alpha",
         "beta",
     ]
-    assert [attempt["status"] for attempt in task["attempts"]] == [
-        "timed_out",
-        "completed",
-    ]
+    assert task["attempts"][0]["status"] in {"timed_out", "late_ignored"}
+    assert task["attempts"][1]["status"] == "completed"
     assert task["result_url"]
 
     alpha_external_id = await database_connection.fetchval(

@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -50,6 +51,117 @@ async def test_successful_payment_creates_user_and_journals_credit(
     assert len(journal) == 1
     assert journal[0]["delta"] == tokens
     assert journal[0]["payment_id"] == payment_id
+
+
+async def test_concurrent_duplicate_payments_are_credited_once(
+    service_client: httpx.AsyncClient,
+    database_connection: asyncpg.Connection,
+    user_id: str,
+    payment_id: str,
+) -> None:
+    user_id = f"User-{user_id}"
+    payment_id = f"Payment-{payment_id}"
+    tokens = 17
+    body = {
+        "payment_id": payment_id,
+        "user_id": user_id,
+        "tokens": tokens,
+        "status": "succeeded",
+    }
+    raw_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    secret = os.getenv("WEBHOOK_SECRET", "test-secret").encode("utf-8")
+    signature = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Signature": signature,
+    }
+
+    responses = await asyncio.gather(
+        *(
+            service_client.post(
+                "/webhooks/payments",
+                content=raw_body,
+                headers=headers,
+            )
+            for _ in range(20)
+        )
+    )
+
+    assert all(200 <= response.status_code < 300 for response in responses)
+
+    journal = await read_journal(database_connection, user_id)
+    assert len(journal) == 1
+    assert journal[0]["delta"] == tokens
+    assert journal[0]["payment_id"] == payment_id
+
+    balance_response = await service_client.get(f"/users/{user_id}/balance")
+    assert balance_response.is_success
+    assert balance_response.json()["balance"] == tokens
+
+    await assert_balance_matches_ledger(database_connection, user_id)
+
+
+async def test_concurrent_first_payments_create_user_once(
+    service_client: httpx.AsyncClient,
+    database_connection: asyncpg.Connection,
+    user_id: str,
+    payment_id: str,
+) -> None:
+    user_id = f"User-{user_id}"
+    payment_ids = [f"Payment-{payment_id}", f"Payment-{uuid4()}"]
+    token_amounts = [13, 17]
+    secret = os.getenv("WEBHOOK_SECRET", "test-secret").encode("utf-8")
+
+    async def send_payment(
+        current_payment_id: str,
+        tokens: int,
+    ) -> httpx.Response:
+        body = {
+            "payment_id": current_payment_id,
+            "user_id": user_id,
+            "tokens": tokens,
+            "status": "succeeded",
+        }
+        raw_body = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        signature = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
+        return await service_client.post(
+            "/webhooks/payments",
+            content=raw_body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature": signature,
+            },
+        )
+
+    responses = await asyncio.gather(
+        *(
+            send_payment(current_payment_id, tokens)
+            for current_payment_id, tokens in zip(
+                payment_ids,
+                token_amounts,
+                strict=True,
+            )
+        )
+    )
+
+    assert all(200 <= response.status_code < 300 for response in responses)
+
+    journal = await read_journal(database_connection, user_id)
+    assert len(journal) == 2
+    assert {entry["payment_id"] for entry in journal} == set(payment_ids)
+    assert sum(entry["delta"] for entry in journal) == sum(token_amounts)
+
+    balance_response = await service_client.get(f"/users/{user_id}/balance")
+    assert balance_response.is_success
+    assert balance_response.json()["balance"] == sum(token_amounts)
+
+    user_count = await database_connection.fetchval(
+        "SELECT COUNT(*) FROM users WHERE user_id = $1",
+        user_id,
+    )
+    assert user_count == 1
+
+    await assert_balance_matches_ledger(database_connection, user_id)
 
 
 async def test_missing_or_invalid_payment_signature_does_not_create_user(

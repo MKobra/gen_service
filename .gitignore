@@ -4,3 +4,12 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
+skills-lock.json
+.agents/
+
+docs/
+agents.md
+AGENTS.md
+CLAUDE.md
+.agents/
+skills-lock.json

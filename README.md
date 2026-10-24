@@ -41,7 +41,7 @@ python -m pytest
 
 ## Четыре обязательных приёмочных теста
 
-Эти тесты соответствуют четырём сценариям из `docs/TASK.md`:
+Эти тесты соответствуют четырём сценариям из `docs/TASK.md:
 
 1. 20 одновременных одинаковых вебхуков оплаты дают одно начисление: `tests/test_payment_webhook.py::test_concurrent_duplicate_payments_are_credited_once`.
 2. 10 одновременных отказов на последней ноге дают один возврат: `tests/test_provider_exhaustion.py::test_concurrent_failures_on_last_leg_refund_once`.
